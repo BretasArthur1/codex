@@ -519,6 +519,44 @@ async fn get_default_branch(cwd: &Path) -> Option<String> {
     get_default_branch_local(cwd).await
 }
 
+/// Determine the default branch using only refs already available locally.
+///
+/// This is used by UI paths that should stay responsive, such as the `/review`
+/// branch picker. It checks each remote's cached symbolic HEAD
+/// (`refs/remotes/<remote>/HEAD`, with `origin` prioritized by `get_git_remotes`)
+/// and then falls back to local `main` or `master`.
+///
+/// Unlike `get_default_branch`, this intentionally does not run
+/// `git remote show <remote>` because that command can contact the network and
+/// noticeably delay opening the picker.
+async fn get_default_branch_from_local_refs(cwd: &Path) -> Option<String> {
+    let remotes = get_git_remotes(cwd).await.unwrap_or_default();
+    for remote in remotes {
+        if let Some(symref_output) = run_git_command_with_timeout(
+            &[
+                "symbolic-ref",
+                "--quiet",
+                &format!("refs/remotes/{remote}/HEAD"),
+            ],
+            cwd,
+        )
+        .await
+            && symref_output.status.success()
+            && let Ok(sym) = String::from_utf8(symref_output.stdout)
+        {
+            let trimmed = sym.trim();
+            let remote_ref_prefix = format!("refs/remotes/{remote}/");
+            if let Some(name) = trimmed.strip_prefix(&remote_ref_prefix)
+                && !name.is_empty()
+            {
+                return Some(name.to_string());
+            }
+        }
+    }
+
+    get_default_branch_local(cwd).await
+}
+
 /// Determine the repository's default branch name, if available.
 ///
 /// This inspects remote configuration first (including the symbolic `HEAD`
@@ -878,7 +916,7 @@ pub async fn local_git_branches(cwd: &Path) -> Vec<String> {
 
     branches.sort_unstable();
 
-    if let Some(base) = get_default_branch_local(cwd).await
+    if let Some(base) = get_default_branch_from_local_refs(cwd).await
         && let Some(pos) = branches.iter().position(|name| name == &base)
     {
         let base_branch = branches.remove(pos);
@@ -906,6 +944,21 @@ mod tests {
     use pretty_assertions::assert_eq;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    fn git<const N: usize>(cwd: &Path, args: [&str; N]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap_or_else(|err| panic!("run git {args:?}: {err}"));
+        assert!(
+            output.status.success(),
+            "git {args:?} failed with {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
 
     #[test]
     fn canonicalize_git_remote_url_normalizes_github_variants() {
@@ -1084,5 +1137,42 @@ mod tests {
                 format!("-c {disabled_hooks} -c core.fsmonitor=true status --porcelain"),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn local_git_branches_prioritizes_remote_default_branch() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let repo = temp_dir.path().join("repo");
+        std::fs::create_dir(&repo).expect("create repository directory");
+
+        git(repo.as_path(), ["init", "-q"]);
+        git(repo.as_path(), ["config", "user.email", "test@example.com"]);
+        git(repo.as_path(), ["config", "user.name", "Test"]);
+        std::fs::write(repo.as_path().join("file.txt"), "init\n").expect("write test file");
+        git(repo.as_path(), ["add", "."]);
+        git(repo.as_path(), ["commit", "-q", "-m", "init"]);
+
+        git(repo.as_path(), ["branch", "-m", "feature"]);
+        git(repo.as_path(), ["branch", "trunk"]);
+
+        git(
+            repo.as_path(),
+            ["remote", "add", "origin", "https://example.com/repo.git"],
+        );
+        git(
+            repo.as_path(),
+            ["update-ref", "refs/remotes/origin/trunk", "trunk"],
+        );
+        git(
+            repo.as_path(),
+            [
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/trunk",
+            ],
+        );
+
+        let branches = local_git_branches(repo.as_path()).await;
+        assert_eq!(branches, vec!["trunk".to_string(), "feature".to_string()]);
     }
 }
